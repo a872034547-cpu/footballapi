@@ -49,6 +49,13 @@ https://football-intel-api.onrender.com/match/demo-001/kelly
 
 能返回 JSON 即 API 公网可用。
 
+## 本次推送记录
+
+- GitHub 仓库：`https://github.com/a872034547-cpu/footballapi.git`
+- 分支：`main`
+- 提交：`8266dbc Deploy FastAPI API to Render`
+- Render 可直接选择该仓库并读取根目录 `render.yaml`。
+
 ## 注意
 
 - Render 免费实例 15 分钟无请求会休眠，首次唤醒可能需要 30-60 秒。
