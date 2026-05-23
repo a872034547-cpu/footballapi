@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.env
+.env.*
+!.env.example
+
+# Local probe/debug artifacts
+_probe_*.py
+_debug_*.py
+_extract_*.py
+_verify_*.py
+*_output.txt
+*_output*.txt
+_ns*_output.txt
+_kelly*_output.txt
+_njstats_js.txt
+
+# Local ToCodex state
+.tocodex/
+
+# Local PHP SQLite data
+php-predict/data/*.db
+php-predict/data/*.db-*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker/local logs
+*.log

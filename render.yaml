@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: football-intel-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: APP_NAME
+        value: football-intel-service
+      - key: APP_ENV
+        value: production
+      - key: DEMO_MODE
+        value: "true"
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "10.0"
+      - key: CACHE_TTL_SECONDS
+        value: "300"
+      - key: FOOTBALL_DATA_API_KEY
+        sync: false
+      - key: THE_ODDS_API_KEY
+        sync: false
+      - key: GOALSERVE_API_KEY
+        sync: false

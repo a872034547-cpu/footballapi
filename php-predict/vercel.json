@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "functions": {
+    "vercel-index.php": {
+      "runtime": "vercel-php@0.7.4"
+    }
+  },
+  "routes": [
+    {
+      "src": "/style.css",
+      "dest": "/style.css"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/vercel-index.php"
+    }
+  ],
+  "env": {
+    "FASTAPI_BASE_URL": "https://your-render-service.onrender.com"
+  }
+}
