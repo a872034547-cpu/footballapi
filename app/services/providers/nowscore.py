@@ -236,10 +236,14 @@ class NowscoreProvider(BaseProvider):
             return None
 
         raw = r.content
+        # 页面实际是 UTF-8（带 BOM），优先 UTF-8 解码
         try:
-            text = raw.decode("gbk")
+            text = raw.decode("utf-8")
         except Exception:
-            text = raw.decode("utf-8", errors="replace")
+            try:
+                text = raw.decode("gbk")
+            except Exception:
+                text = raw.decode("utf-8", errors="replace")
 
         soup = BeautifulSoup(text, "html.parser")
 
@@ -247,21 +251,76 @@ class NowscoreProvider(BaseProvider):
         for tag in soup.find_all(["script", "style"]):
             tag.decompose()
 
-        # 提取联赛
+        # ── 提取联赛 ──────────────────────────────────────
         league = ""
-        league_el = soup.find("a", href=re.compile(r"league|ls"))
+        # 尝试从页面标题提取联赛信息
+        title_tag = soup.find("title")
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            # 标题格式: "2月16日羅馬PR VS 伊雷提首发阵容名单|..."
+            # 联赛可能在面包屑或其他位置
+        # 尝试找联赛链接或文本
+        league_el = soup.find("a", href=re.compile(r"league|ls|match\.aspx\?type"))
         if league_el:
             league = league_el.get_text(strip=True)
+        if not league:
+            # 尝试从 breadcrumb 或导航提取
+            nav_links = soup.find_all("a", href=re.compile(r"ls\.aspx|league\.aspx|match\.aspx"))
+            for link in nav_links:
+                txt = link.get_text(strip=True)
+                if txt and len(txt) >= 2 and not re.match(r"^\d", txt):
+                    league = txt
+                    break
 
-        # 提取主队/客队
+        # ── 提取主队/客队 ──────────────────────────────────
         home_name = ""
         away_name = ""
-        team_links = soup.find_all("a", href=re.compile(r"team"))
-        if len(team_links) >= 2:
-            home_name = team_links[0].get_text(strip=True)
-            away_name = team_links[1].get_text(strip=True)
+        # 新结构: <a href="...team/Summary.aspx?teamid=..."><span class="name">隊名</span></a>
+        team_spans = soup.find_all("span", class_="name")
+        if len(team_spans) >= 2:
+            home_name = team_spans[0].get_text(strip=True)
+            away_name = team_spans[1].get_text(strip=True)
+        if not home_name:
+            # 旧结构回退: <a href="...team...">隊名</a>
+            team_links = soup.find_all("a", href=re.compile(r"team"))
+            if len(team_links) >= 2:
+                home_name = team_links[0].get_text(strip=True)
+                away_name = team_links[1].get_text(strip=True)
 
-        # 提取比分
+        # ── 提取开赛时间 ──────────────────────────────────
+        kickoff = ""
+        # 新格式: "開賽時間：2012-02-16 06:30" 或 "开赛时间：..."
+        kickoff_match = re.search(r"[開开]賽時时间[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{2}:\d{2})", text)
+        if kickoff_match:
+            kickoff = kickoff_match.group(1).strip()
+        if not kickoff:
+            # 旧格式回退: 纯日期时间字符串
+            date_el = soup.find(string=re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{2}:\d{2}"))
+            if date_el:
+                raw_date = date_el.strip()
+                if len(raw_date) > 19:
+                    raw_date = raw_date[:19]
+                kickoff = raw_date
+
+        # ── 提取状态 ──────────────────────────────────────
+        status = "SCHEDULED"
+        status_el = soup.find(string=re.compile(r"(进行中|已结束|未开始|中场|完场|推迟|取消|完赛)"))
+        if status_el:
+            status_text = status_el.strip()
+            if "进行中" in status_text or "上半" in status_text:
+                status = "LIVE"
+            elif "中场" in status_text:
+                status = "HT"
+            elif "下半" in status_text:
+                status = "LIVE"
+            elif "已结束" in status_text or "完场" in status_text or "完赛" in status_text:
+                status = "FINISHED"
+            elif "推迟" in status_text:
+                status = "POSTPONED"
+            elif "取消" in status_text:
+                status = "CANCELLED"
+
+        # ── 提取比分 ──────────────────────────────────────
         home_score: int | None = None
         away_score: int | None = None
         score_el = soup.find("span", class_=re.compile(r"score|red|bf"), id=re.compile(r"score|bf"))
@@ -274,47 +333,22 @@ class NowscoreProvider(BaseProvider):
                 home_score = int(score_match.group(1))
                 away_score = int(score_match.group(2))
 
-        # 提取比赛时间
-        kickoff = ""
+        # ── 提取比赛分钟数 ────────────────────────────────
         minute: int | None = None
-        status = "SCHEDULED"
-
-        time_el = soup.find(string=re.compile(r"\d{2}:\d{2}"))
-        if time_el:
-            time_str = time_el.strip()
-            if re.match(r"\d{2}:\d{2}$", time_str):
-                # 可能是比赛分钟数
-                parts = time_str.split(":")
-                minute = int(parts[0])
-                status = "LIVE"
-
-        # 提取开赛时间（仅匹配纯日期时间字符串，排除 JS 代码中的日期）
-        date_el = soup.find(string=re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{2}:\d{2}"))
-        if not date_el:
-            date_el = soup.find(string=re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$"))
-        if date_el:
-            raw_date = date_el.strip()
-            # 只取前 19 个字符（ISO 格式），防止尾部混入垃圾
-            if len(raw_date) > 19:
-                raw_date = raw_date[:19]
-            kickoff = raw_date
-
-        # 提取状态文本
-        status_el = soup.find(string=re.compile(r"(进行中|已结束|未开始|中场|完场|推迟|取消)"))
-        if status_el:
-            status_text = status_el.strip()
-            if "进行中" in status_text or "上半" in status_text:
-                status = "LIVE"
-            elif "中场" in status_text:
-                status = "HT"
-            elif "下半" in status_text:
-                status = "LIVE"
-            elif "已结束" in status_text or "完场" in status_text:
-                status = "FINISHED"
-            elif "推迟" in status_text:
-                status = "POSTPONED"
-            elif "取消" in status_text:
-                status = "CANCELLED"
+        if status == "LIVE" or status == "HT":
+            # 找分钟数（排除开赛时间中的 HH:MM）
+            # 分钟数通常在状态文本附近，如 "45'" 或 "90+'"
+            minute_match = re.search(r"(\d{1,3})\s*['′]", text)
+            if minute_match:
+                minute = int(minute_match.group(1))
+            if minute is None:
+                # 尝试找独立的 HH:MM（不是开赛时间的一部分）
+                # 排除包含年份的行
+                for match in re.finditer(r"(?<!\d{4}[-/]\d{1,2}[-/]\d{1,2}\s)(\d{1,2}):(\d{2})(?!\s*\d{4})", text):
+                    m_val = int(match.group(1))
+                    if 1 <= m_val <= 120:
+                        minute = m_val
+                        break
 
         if not home_name or not away_name:
             return None
@@ -323,8 +357,8 @@ class NowscoreProvider(BaseProvider):
             id=f"nowscore-{match_id}",
             home_team=TeamRef(name=home_name),
             away_team=TeamRef(name=away_name),
-            kickoff=kickoff or None,
-            league=league or None,
+            kickoff=kickoff or "",
+            league=league or "",
             status=status,
             home_score=home_score,
             away_score=away_score,

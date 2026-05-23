@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.config import get_settings
@@ -63,8 +64,10 @@ class MatchAggregator:
 
     async def get_upcoming_matches(self, date: str | None = None) -> list[MatchRef]:
         merged: dict[str, MatchRef] = {}
+        nowscore_matches: list[MatchRef] = []
 
-        for provider in (self.football_data, self.the_odds, self.goalserve, self.wubai, self.zgzcw, self.njstats, self.nowscore):
+        # nowscore 优先：它有实时比分/状态；zgzcw 其次：它有最全的赛程列表
+        for provider in (self.nowscore, self.zgzcw, self.wubai, self.football_data, self.the_odds, self.goalserve, self.njstats):
             try:
                 matches = await provider.get_upcoming_matches(date=date)
             except Exception:
@@ -77,6 +80,79 @@ class MatchAggregator:
                 key = str(match.id).strip()
                 if key and key not in merged:
                     merged[key] = match
+                    if provider is self.nowscore:
+                        nowscore_matches.append(match)
+
+        # ── 跨源状态合并 ──────────────────────────────────────
+        # nowscore 使用 "nowscore-{id}" 前缀 ID，zgzcw 使用纯数字 ID，
+        # 两者按 ID 永远无法匹配。通过 (联赛, 主队名, 客队名) 三元组
+        # 将 nowscore 的实时状态/比分/分钟数覆盖到 zgzcw 比赛上。
+        if nowscore_matches:
+            ns_index: dict[tuple[str, str, str], MatchRef] = {}
+            for ns in nowscore_matches:
+                ns_key = (
+                    (ns.league or "").strip().lower(),
+                    (ns.home_team.name or "").strip().lower(),
+                    (ns.away_team.name or "").strip().lower(),
+                )
+                ns_index[ns_key] = ns
+
+            for key, match in list(merged.items()):
+                if key.startswith("nowscore-"):
+                    continue
+                if match.status and match.status != "SCHEDULED":
+                    continue
+
+                match_key = (
+                    (match.league or "").strip().lower(),
+                    (match.home_team.name or "").strip().lower(),
+                    (match.away_team.name or "").strip().lower(),
+                )
+
+                ns_match = ns_index.get(match_key)
+                if ns_match and ns_match.status and ns_match.status != "SCHEDULED":
+                    match.status = ns_match.status
+                    match.home_score = ns_match.home_score
+                    match.away_score = ns_match.away_score
+                    match.minute = ns_match.minute
+                    match.live_status = ns_match.live_status
+
+        # ── 基于时间的状态推断（兜底）────────────────────────
+        # 当所有 provider 都只返回 SCHEDULED 时，根据开赛时间推断实际状态。
+        # 足球比赛通常 90 分钟 + 中场 15 分钟 + 补时 ≈ 120 分钟。
+        # 注意：zgzcw 返回的 kickoff 是北京时间 (UTC+8)，需要转换。
+        from datetime import timedelta
+        CST = timezone(timedelta(hours=8))
+        now_utc = datetime.now(timezone.utc)
+        for match in merged.values():
+            if match.status and match.status != "SCHEDULED":
+                continue
+            if not match.kickoff:
+                continue
+            try:
+                # 尝试多种日期格式（kickoff 是北京时间）
+                kt_cst = None
+                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+                    try:
+                        kt_cst = datetime.strptime(match.kickoff[:19], fmt).replace(tzinfo=CST)
+                        break
+                    except ValueError:
+                        continue
+                if kt_cst is None:
+                    continue
+
+                # 转为 UTC 进行比较
+                kt_utc = kt_cst.astimezone(timezone.utc)
+                elapsed = (now_utc - kt_utc).total_seconds()
+                if elapsed > 150 * 60:  # 开赛超过 2.5 小时 → 已结束
+                    match.status = "FINISHED"
+                    match.live_status = "FINISHED"
+                elif elapsed > 0:  # 已开赛但未超过 2.5 小时 → 进行中
+                    match.status = "LIVE"
+                    match.live_status = "LIVE"
+                    match.minute = min(int(elapsed // 60), 120)
+            except Exception:
+                continue
 
         return list(merged.values())
 
