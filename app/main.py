@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 
 from fastapi import FastAPI, HTTPException
 
@@ -55,6 +56,10 @@ def create_app() -> FastAPI:
         if not snapshot.odds:
             raise HTTPException(status_code=404, detail="Odds not found for this match")
         return snapshot.odds
+
+    @app.get("/cache/stats")
+    async def get_cache_stats() -> object:
+        return [asdict(stat) for stat in aggregator.cache_stats()]
 
     return app
 

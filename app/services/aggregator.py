@@ -5,6 +5,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.models import MatchRef, MatchSnapshot, OddsSnapshot, SourceStatus
+from app.services.cache import CacheStats, TTLCache
 from app.services.providers.football_data import FootballDataProvider
 from app.services.providers.goalserve import GoalserveProvider
 from app.services.providers.njstats import NjstatsProvider
@@ -12,6 +13,12 @@ from app.services.providers.nowscore import NowscoreProvider
 from app.services.providers.the_odds_api import TheOddsApiProvider
 from app.services.providers.wubai import WubaiProvider
 from app.services.providers.zgzcw import ZgzcwProvider
+
+
+_MATCH_LIST_CACHE = TTLCache[list[MatchRef]]("match_lists", ttl_seconds=300, maxsize=32)
+_MATCH_BY_ID_CACHE = TTLCache[MatchRef]("match_refs", ttl_seconds=300, maxsize=512)
+_MATCH_SNAPSHOT_CACHE = TTLCache[MatchSnapshot]("match_snapshots", ttl_seconds=300, maxsize=256)
+_PROVIDER_ODDS_CACHE = TTLCache[OddsSnapshot]("provider_odds", ttl_seconds=300, maxsize=768)
 
 
 class MatchAggregator:
@@ -35,6 +42,32 @@ class MatchAggregator:
             "njstats": self.njstats,
             "nowscore": self.nowscore,
         }
+
+    def _cache_ttl(self) -> int:
+        return max(int(getattr(self.settings, "cache_ttl_seconds", 300) or 300), 1)
+
+    @staticmethod
+    def _cache_key(*parts: object) -> tuple[str, ...]:
+        return tuple("" if part is None else str(part).strip() for part in parts)
+
+    def _cache_matches_by_id(self, matches: list[MatchRef]) -> None:
+        ttl = self._cache_ttl()
+        for match in matches:
+            key = str(match.id).strip()
+            if key:
+                _MATCH_BY_ID_CACHE.set(key, match, ttl_seconds=ttl)
+
+    def get_cached_match_ref(self, match_id: str) -> MatchRef | None:
+        """只读取已缓存的比赛基础信息，不触发外部接口刷新。"""
+        return _MATCH_BY_ID_CACHE.get(str(match_id).strip())
+
+    def cache_stats(self) -> list[CacheStats]:
+        return [
+            _MATCH_LIST_CACHE.stats(),
+            _MATCH_BY_ID_CACHE.stats(),
+            _MATCH_SNAPSHOT_CACHE.stats(),
+            _PROVIDER_ODDS_CACHE.stats(),
+        ]
 
     def describe_sources(self) -> list[SourceStatus]:
         enabled_sources = getattr(self.settings, "enabled_sources", {})
@@ -63,6 +96,12 @@ class MatchAggregator:
         return sources
 
     async def get_upcoming_matches(self, date: str | None = None) -> list[MatchRef]:
+        cache_key = self._cache_key("upcoming", date or "today")
+        cached = _MATCH_LIST_CACHE.get(cache_key)
+        if cached is not None:
+            self._cache_matches_by_id(cached)
+            return cached
+
         merged: dict[str, MatchRef] = {}
         nowscore_matches: list[MatchRef] = []
 
@@ -154,9 +193,17 @@ class MatchAggregator:
             except Exception:
                 continue
 
-        return list(merged.values())
+        result = list(merged.values())
+        _MATCH_LIST_CACHE.set(cache_key, result, ttl_seconds=self._cache_ttl())
+        self._cache_matches_by_id(result)
+        return result
 
     async def get_match_snapshot(self, match_id: str) -> MatchSnapshot:
+        normalized_match_id = str(match_id).strip()
+        cached = _MATCH_SNAPSHOT_CACHE.get(normalized_match_id)
+        if cached is not None:
+            return cached
+
         provider_errors: list[str] = []
         snapshot: MatchSnapshot | None = None
 
@@ -166,7 +213,7 @@ class MatchAggregator:
         real_providers = (self.zgzcw, self.nowscore, self.wubai)
         for provider in real_providers:
             try:
-                snapshot = await provider.get_match_snapshot(match_id)
+                snapshot = await provider.get_match_snapshot(normalized_match_id)
                 if snapshot is not None and snapshot.match.home_team.name:
                     break
             except Exception as exc:
@@ -176,31 +223,52 @@ class MatchAggregator:
         # ── 回退：football_data（可能是 demo 数据）──
         if snapshot is None:
             try:
-                snapshot = await self.football_data.get_match_snapshot(match_id)
+                snapshot = await self.football_data.get_match_snapshot(normalized_match_id)
             except Exception as exc:
                 provider_errors.append(f"football_data:{exc.__class__.__name__}")
-                snapshot = self.football_data.build_demo_snapshot(match_id)
+                snapshot = self.football_data.build_demo_snapshot(normalized_match_id)
 
         base_odds = snapshot.odds
         merged_prices = []
         odds_sources: list[str] = []
         last_update: str | None = None
+        seen_provider_odds_sources: set[str] = set()
+
+        # 如果 provider snapshot 已经携带赔率，先复用，避免同一请求内重复抓同源赔率。
+        if isinstance(base_odds, OddsSnapshot):
+            if base_odds.prices:
+                merged_prices.extend(base_odds.prices)
+            if base_odds.source:
+                odds_sources.append(base_odds.source)
+                seen_provider_odds_sources.add(base_odds.source)
+            if base_odds.last_update:
+                last_update = base_odds.last_update
 
         # ── 合并所有 provider 的赔率数据 ──
         for provider in (self.the_odds, self.goalserve, self.wubai, self.zgzcw, self.njstats, self.nowscore):
-            try:
-                odds = await provider.get_match_odds(match_id)
-            except Exception as exc:
-                provider_errors.append(f"{provider.name}:{exc.__class__.__name__}")
-                continue
+            odds_cache_key = self._cache_key(provider.name, normalized_match_id)
+            odds = _PROVIDER_ODDS_CACHE.get(odds_cache_key)
+            if odds is None:
+                try:
+                    odds = await provider.get_match_odds(normalized_match_id)
+                except Exception as exc:
+                    provider_errors.append(f"{provider.name}:{exc.__class__.__name__}")
+                    continue
+
+                if isinstance(odds, OddsSnapshot):
+                    _PROVIDER_ODDS_CACHE.set(odds_cache_key, odds, ttl_seconds=self._cache_ttl())
 
             if not isinstance(odds, OddsSnapshot):
+                continue
+
+            if odds.source in seen_provider_odds_sources:
                 continue
 
             if odds.prices:
                 merged_prices.extend(odds.prices)
             if odds.source:
                 odds_sources.append(odds.source)
+                seen_provider_odds_sources.add(odds.source)
             if odds.last_update and (last_update is None or odds.last_update > last_update):
                 last_update = odds.last_update
 
@@ -211,7 +279,7 @@ class MatchAggregator:
                 odds_sources.append(base_odds.source)
 
         snapshot.odds = OddsSnapshot(
-            match_id=match_id,
+            match_id=normalized_match_id,
             prices=merged_prices,
             last_update=last_update,
             source="aggregated",
@@ -229,6 +297,8 @@ class MatchAggregator:
             notes.append("Some providers failed and were replaced with fallback data.")
         snapshot.pre_match_notes = list(dict.fromkeys(notes))
 
+        _MATCH_SNAPSHOT_CACHE.set(normalized_match_id, snapshot, ttl_seconds=self._cache_ttl())
+        _MATCH_BY_ID_CACHE.set(normalized_match_id, snapshot.match, ttl_seconds=self._cache_ttl())
         return snapshot
 
 

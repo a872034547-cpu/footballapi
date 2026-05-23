@@ -111,22 +111,14 @@ async def get_match_analysis(
     predictor: RuleBasedPredictor = Depends(get_predictor),
 ) -> AnalysisResponse:
     try:
-        # ── 先从 upcoming matches 查找真实比赛身份 ──
-        real_match: MatchRef | None = None
-        try:
-            all_matches = await aggregator.get_upcoming_matches()
-            for m in all_matches:
-                if str(m.id) == str(match_id):
-                    real_match = m
-                    break
-        except Exception:
-            pass
-
+        # 只读取已缓存的比赛身份，不为单场分析主动刷新全量赛程。
+        # 这样 Match ID 获取与分析接口解耦，避免一次分析触发多源列表抓取。
+        cached_match = aggregator.get_cached_match_ref(match_id)
         snapshot = await aggregator.get_match_snapshot(match_id)
 
-        # ── 用真实身份覆盖 demo 数据 ──
-        if real_match is not None:
-            snapshot.match = real_match
+        # 用已知真实身份覆盖 fallback/demo snapshot，但不触发额外外部请求。
+        if cached_match is not None:
+            snapshot.match = cached_match
 
         return predictor.analyze_snapshot(snapshot)
     except Exception as exc:
