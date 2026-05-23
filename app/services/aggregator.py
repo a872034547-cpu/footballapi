@@ -82,18 +82,35 @@ class MatchAggregator:
 
     async def get_match_snapshot(self, match_id: str) -> MatchSnapshot:
         provider_errors: list[str] = []
+        snapshot: MatchSnapshot | None = None
 
-        try:
-            snapshot = await self.football_data.get_match_snapshot(match_id)
-        except Exception as exc:
-            provider_errors.append(f"football_data:{exc.__class__.__name__}")
-            snapshot = self.football_data.build_demo_snapshot(match_id)
+        # ── 优先使用有真实数据的 provider 获取 snapshot ──
+        # zgzcw / nowscore / wubai 是逆向抓取器，能拿到真实比赛数据
+        # football_data / the_odds / goalserve 需要 API key，demo 模式下返回假数据
+        real_providers = (self.zgzcw, self.nowscore, self.wubai)
+        for provider in real_providers:
+            try:
+                snapshot = await provider.get_match_snapshot(match_id)
+                if snapshot is not None and snapshot.match.home_team.name:
+                    break
+            except Exception as exc:
+                provider_errors.append(f"{provider.name}:{exc.__class__.__name__}")
+                continue
+
+        # ── 回退：football_data（可能是 demo 数据）──
+        if snapshot is None:
+            try:
+                snapshot = await self.football_data.get_match_snapshot(match_id)
+            except Exception as exc:
+                provider_errors.append(f"football_data:{exc.__class__.__name__}")
+                snapshot = self.football_data.build_demo_snapshot(match_id)
 
         base_odds = snapshot.odds
         merged_prices = []
         odds_sources: list[str] = []
         last_update: str | None = None
 
+        # ── 合并所有 provider 的赔率数据 ──
         for provider in (self.the_odds, self.goalserve, self.wubai, self.zgzcw, self.njstats, self.nowscore):
             try:
                 odds = await provider.get_match_odds(match_id)

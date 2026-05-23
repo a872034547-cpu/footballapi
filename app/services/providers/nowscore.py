@@ -243,6 +243,10 @@ class NowscoreProvider(BaseProvider):
 
         soup = BeautifulSoup(text, "html.parser")
 
+        # 移除 script/style 标签，防止 JS 代码污染字段提取
+        for tag in soup.find_all(["script", "style"]):
+            tag.decompose()
+
         # 提取联赛
         league = ""
         league_el = soup.find("a", href=re.compile(r"league|ls"))
@@ -284,10 +288,16 @@ class NowscoreProvider(BaseProvider):
                 minute = int(parts[0])
                 status = "LIVE"
 
-        # 提取开赛时间
-        date_el = soup.find(string=re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"))
+        # 提取开赛时间（仅匹配纯日期时间字符串，排除 JS 代码中的日期）
+        date_el = soup.find(string=re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{2}:\d{2}"))
+        if not date_el:
+            date_el = soup.find(string=re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$"))
         if date_el:
-            kickoff = date_el.strip()
+            raw_date = date_el.strip()
+            # 只取前 19 个字符（ISO 格式），防止尾部混入垃圾
+            if len(raw_date) > 19:
+                raw_date = raw_date[:19]
+            kickoff = raw_date
 
         # 提取状态文本
         status_el = soup.find(string=re.compile(r"(进行中|已结束|未开始|中场|完场|推迟|取消)"))

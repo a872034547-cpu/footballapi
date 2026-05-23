@@ -13,7 +13,7 @@ services:
       - key: APP_ENV
         value: production
       - key: DEMO_MODE
-        value: "true"
+        value: "false"
       - key: REQUEST_TIMEOUT_SECONDS
         value: "10.0"
       - key: CACHE_TTL_SECONDS

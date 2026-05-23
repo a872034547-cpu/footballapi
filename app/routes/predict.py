@@ -111,7 +111,23 @@ async def get_match_analysis(
     predictor: RuleBasedPredictor = Depends(get_predictor),
 ) -> AnalysisResponse:
     try:
+        # ── 先从 upcoming matches 查找真实比赛身份 ──
+        real_match: MatchRef | None = None
+        try:
+            all_matches = await aggregator.get_upcoming_matches()
+            for m in all_matches:
+                if str(m.id) == str(match_id):
+                    real_match = m
+                    break
+        except Exception:
+            pass
+
         snapshot = await aggregator.get_match_snapshot(match_id)
+
+        # ── 用真实身份覆盖 demo 数据 ──
+        if real_match is not None:
+            snapshot.match = real_match
+
         return predictor.analyze_snapshot(snapshot)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to analyze match: {exc}") from exc

@@ -50,7 +50,7 @@ class KellyCalculator:
                 continue
             for price in snapshot.prices:
                 bookmaker = price.bookmaker or "unknown"
-                market = price.market or ""
+                market = (price.market or "").lower()
                 by_bookmaker[bookmaker][market].append(price)
 
         if not by_bookmaker:

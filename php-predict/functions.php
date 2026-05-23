@@ -179,6 +179,8 @@ function api_get(string $path): array
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_HTTPHEADER     => ['Accept: application/json'],
         CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
     ]);
 
     $body       = curl_exec($ch);
@@ -202,6 +204,89 @@ function api_get(string $path): array
     return $data;
 }
 
+/**
+ * 并行调用多个 API 端点，返回结果数组。
+ *
+ * 使用 curl_multi 实现并发请求，大幅减少页面加载时间。
+ *
+ * @param  array<string, string> $endpoints  键名 => API 路径 的映射
+ *    例如: ['analysis' => '/match/demo-001/analysis', 'kelly' => '/match/demo-001/kelly']
+ * @return array<string, array>  键名 => 解码后的 JSON 数组
+ * @throws RuntimeException 任一请求失败时抛出
+ */
+function api_get_multi(array $endpoints): array
+{
+    $baseUrl = rtrim(config('api.base_url'), '/');
+    $timeout = (int) config('api.timeout', 30);
+
+    $mh = curl_multi_init();
+    /** @var array<string, CurlHandle> $handles */
+    $handles = [];
+
+    foreach ($endpoints as $key => $path) {
+        $url = $baseUrl . '/' . ltrim($path, '/');
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_HTTPHEADER     => ['Accept: application/json'],
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$key] = $ch;
+    }
+
+    // 执行所有请求（带超时保护，防止 Render 冷启动时无限阻塞）
+    // Windows 上 curl_multi_select 不可靠，用 usleep 兜底
+    $running = 0;
+    $deadline = microtime(true) + $timeout + 10; // 总超时 = API 超时 + 10s 缓冲
+    do {
+        $status = curl_multi_exec($mh, $running);
+        if ($running > 0) {
+            // Windows: curl_multi_select 返回 -1 立即返回，用 usleep 避免 CPU 空转
+            if (curl_multi_select($mh, 0.5) === -1) {
+                usleep(100000); // 100ms
+            }
+        }
+        if (microtime(true) > $deadline) {
+            break;
+        }
+    } while ($running > 0 && $status === CURLM_OK);
+
+    // 收集结果
+    $results = [];
+    foreach ($handles as $key => $ch) {
+        $url      = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        $body     = curl_multi_getcontent($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error    = curl_error($ch);
+
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+
+        if ($body === false || $error !== '') {
+            throw new RuntimeException("API 并行请求失败 [{$url}]: {$error}");
+        }
+
+        if ($httpCode >= 400) {
+            throw new RuntimeException("API 返回 HTTP {$httpCode} [{$url}]: " . substr($body, 0, 500));
+        }
+
+        $data = json_decode($body, true);
+        if (!is_array($data)) {
+            throw new RuntimeException("API 返回非 JSON 数据 [{$url}]");
+        }
+
+        $results[$key] = $data;
+    }
+
+    curl_multi_close($mh);
+    return $results;
+}
+
 // ---------------------------------------------------------------------------
 // 4. 安全转义
 // ---------------------------------------------------------------------------
@@ -214,7 +299,10 @@ function api_get(string $path): array
  */
 function e(?string $str): string
 {
-    return htmlspecialchars((string) $str, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $clean = strip_tags((string) $str);
+    // 超长字符串（>100 字符）通常是 API 返回的垃圾 JS/HTML 代码
+    if (strlen($clean) > 100) $clean = substr($clean, 0, 100) . '…';
+    return htmlspecialchars($clean, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
 // ---------------------------------------------------------------------------

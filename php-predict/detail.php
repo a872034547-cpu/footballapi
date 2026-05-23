@@ -1,1083 +1,805 @@
 <?php
 /**
- * detail.php — 比赛详情页
+ * 比赛详情页 — 预测结果置顶 + 溯源证据 + 详细数据
  *
- * 功能：
- *   - URL 参数 ?match_id=xxx 指定比赛
- *   - 展示比赛基本信息、三大市场预测、模式匹配证据、滚球预测
- *   - 进行中比赛 AJAX 轮询实时比分
+ * 纯 API 驱动，使用 api_get_multi() 并行请求：
+ *   - /match/{id}/analysis   → 预测 + 溯源
+ *   - /match/{id}/kelly      → 凯利指数
+ *   - /match/{id}/rolling    → 滚球预测
  */
 
-declare(strict_types=1);
+require_once __DIR__ . '/functions.php';
 
-require __DIR__ . '/functions.php';
+// Render 免费层冷启动可能需 30s+，放宽执行时间限制
+set_time_limit(90);
 
-// ---------------------------------------------------------------------------
-// 初始化
-// ---------------------------------------------------------------------------
-init_db();
-$db = db();
-
-// ---------------------------------------------------------------------------
-// 获取 match_id
-// ---------------------------------------------------------------------------
-$matchId = trim($_GET['match_id'] ?? '');
+$matchId = $_GET['match_id'] ?? '';
 if ($matchId === '') {
     http_response_code(400);
-    echo '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>缺少参数</title></head><body style="background:#030c18;color:#edf7ff;font-family:sans-serif;padding:40px;text-align:center;"><h1>⚠️ 缺少 match_id 参数</h1><p><a href="index.php" style="color:#7df48b;">← 返回首页</a></p></body></html>';
+    echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>缺少参数</title>';
+    echo '<link rel="stylesheet" href="/style.css"></head><body>';
+    echo '<div class="container"><div class="api-error">缺少比赛 ID 参数。请从首页选择一场比赛。</div></div>';
+    echo '</body></html>';
     exit;
 }
 
 // ---------------------------------------------------------------------------
-// 查询比赛信息
-// ---------------------------------------------------------------------------
-$stmt = $db->prepare('SELECT * FROM matches WHERE match_id = :match_id');
-$stmt->bindValue(':match_id', $matchId, SQLITE3_TEXT);
-$result = $stmt->execute();
-$match = $result->fetchArray(SQLITE3_ASSOC);
-
-if (!$match) {
-    http_response_code(404);
-    echo '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>比赛不存在</title></head><body style="background:#030c18;color:#edf7ff;font-family:sans-serif;padding:40px;text-align:center;"><h1>🔍 比赛不存在</h1><p>match_id: ' . e($matchId) . '</p><p><a href="index.php" style="color:#7df48b;">← 返回首页</a></p></body></html>';
-    exit;
-}
-
-// ---------------------------------------------------------------------------
-// 查询该比赛的所有预测
-// ---------------------------------------------------------------------------
-$stmt = $db->prepare('
-    SELECT p.*, pr.hit_status AS result_status, pr.profit, pr.roi, pr.result_text, pr.settled_at
-    FROM predictions p
-    LEFT JOIN prediction_results pr ON p.id = pr.prediction_id
-    WHERE p.match_id = :match_id
-    ORDER BY p.market, p.confidence DESC
-');
-$stmt->bindValue(':match_id', $matchId, SQLITE3_TEXT);
-$predResult = $stmt->execute();
-
-$predictions = [];
-while ($row = $predResult->fetchArray(SQLITE3_ASSOC)) {
-    $predictions[] = $row;
-}
-
-// ---------------------------------------------------------------------------
-// 判断比赛状态
-// ---------------------------------------------------------------------------
-$matchStatus = strtoupper($match['status'] ?? 'SCHEDULED');
-$isLive      = in_array($matchStatus, ['LIVE', 'HT'], true);
-$isFinished  = in_array($matchStatus, ['FT', 'FINISHED'], true);
-$isScheduled = in_array($matchStatus, ['SCHEDULED', 'NS'], true);
-
-$homeScore = $match['home_score'] ?? null;
-$awayScore = $match['away_score'] ?? null;
-$minute    = 0; // 数据库中暂无 minute 字段，后续可从 API 获取
-
-// ---------------------------------------------------------------------------
-// 从 API 获取增强数据
-// ---------------------------------------------------------------------------
-$apiAnalysis   = null;
-$rollingData   = null;
-$apiError      = null;
-
-try {
-    if ($isLive) {
-        // 进行中：调用滚球预测 API
-        $hScore = (int)($homeScore ?? 0);
-        $aScore = (int)($awayScore ?? 0);
-        $rollingData = api_get("/match/{$matchId}/rolling?minute={$minute}&home_score={$hScore}&away_score={$aScore}");
-    } elseif ($isScheduled) {
-        // 未开赛：调用完整分析 API（含 pattern_matches）
-        $apiAnalysis = api_get("/match/{$matchId}/analysis");
-    }
-    // 已结束比赛：仅展示本地数据，不调 API
-} catch (RuntimeException $e) {
-    $apiError = $e->getMessage();
-}
-
-// ---------------------------------------------------------------------------
-// 辅助函数（复用 index.php 中的逻辑）
+// 辅助函数
 // ---------------------------------------------------------------------------
 
 function market_label(string $market): string
 {
     return match ($market) {
-        '1x2'             => '胜平负',
-        'over_under'      => '大小球',
-        'asian_handicap'  => '亚盘',
-        default           => $market,
+        '1x2'            => '胜平负',
+        'over_under'     => '大小球',
+        'asian_handicap' => '亚盘',
+        default          => $market,
     };
 }
 
-function direction_badge(string $market, string $direction): string
+function direction_badge(string $market, string $label): string
 {
-    $lower = strtolower($direction);
     return match ($market) {
         '1x2' => match (true) {
-            str_contains($lower, 'home')   => '<span class="badge-hit">主胜</span>',
-            str_contains($lower, 'draw')   => '<span class="badge-pending">平局</span>',
-            str_contains($lower, 'away')   => '<span class="badge-miss">客胜</span>',
-            default                        => e($direction),
+            str_contains($label, 'home')  => '主胜',
+            str_contains($label, 'draw')  => '平局',
+            str_contains($label, 'away')  => '客胜',
+            default                       => $label,
         },
         'over_under' => match (true) {
-            str_contains($lower, 'over')   => '<span class="badge-hit">大球 ' . e($direction) . '</span>',
-            str_contains($lower, 'under')  => '<span class="badge-miss">小球 ' . e($direction) . '</span>',
-            default                        => e($direction),
+            str_contains($label, 'over')  => '大球',
+            str_contains($label, 'under') => '小球',
+            default                       => $label,
         },
         'asian_handicap' => match (true) {
-            str_contains($lower, 'home')   => '<span class="badge-hit">主 ' . e($direction) . '</span>',
-            str_contains($lower, 'away')   => '<span class="badge-miss">客 ' . e($direction) . '</span>',
-            default                        => e($direction),
+            str_contains($label, 'home')  => '主队',
+            str_contains($label, 'away')  => '客队',
+            default                       => $label,
         },
-        default => e($direction),
+        default => $label,
     };
 }
 
-function status_badge(?string $status): string
-{
-    if ($status === null) return '<span class="badge-pending">待结算</span>';
-    return match ($status) {
-        'hit'  => '<span class="badge-hit">✓ 命中</span>',
-        'miss' => '<span class="badge-miss">✗ 未中</span>',
-        'void' => '<span class="badge-pending">~ 走水</span>',
-        default => '<span class="badge-pending">' . e($status) . '</span>',
-    };
-}
-
-function format_kickoff(?string $kickoff): string
-{
-    if (empty($kickoff)) return '-';
-    $ts = strtotime($kickoff);
-    if ($ts === false) return e($kickoff);
-    return date('Y-m-d H:i', $ts);
-}
-
-function display_score(?int $home, ?int $away): string
-{
-    if ($home === null || $away === null) return 'vs';
-    return "{$home} : {$away}";
-}
-
-function match_status_text(string $status): string
-{
-    return match (strtoupper($status)) {
-        'SCHEDULED', 'NS' => '未开赛',
-        'LIVE'            => '● 进行中',
-        'HT'              => '⏸ 中场休息',
-        'FT', 'FINISHED'  => '已结束',
-        default           => $status,
-    };
-}
-
-function confidence_level_class(string $level): string
+function confidence_class(string $level): string
 {
     return match (strtoupper($level)) {
-        'A' => 'badge-hit',
-        'B' => 'badge-hit',
-        'C' => 'badge-pending',
-        'D' => 'badge-miss',
-        default => '',
+        'A' => 'confidence-a',
+        'B' => 'confidence-b',
+        'C' => 'confidence-c',
+        'D' => 'confidence-d',
+        default => 'confidence-c',
     };
 }
 
-function confidence_level_text(string $level): string
+function confidence_text(string $level): string
 {
     return match (strtoupper($level)) {
         'A' => '高信心',
         'B' => '较高信心',
         'C' => '中等信心',
         'D' => '低信心',
-        default => $level,
+        default => '未知',
     };
 }
 
-// ---------------------------------------------------------------------------
-// 按市场分组本地预测
-// ---------------------------------------------------------------------------
-$localByMarket = [];
-foreach ($predictions as $p) {
-    $mkt = $p['market'];
-    if (!isset($localByMarket[$mkt])) {
-        $localByMarket[$mkt] = [];
+function pattern_type_label(string $type): string
+{
+    return match ($type) {
+        'handicap_derivation' => '盘口推导',
+        'odds_implied'        => '赔率隐含概率',
+        'asian_water'         => '亚盘水位分析',
+        'totals'              => '进球预期分析',
+        default               => $type,
+    };
+}
+
+function rolling_type_label(string $type): string
+{
+    return match ($type) {
+        'win_draw_lose'   => '胜平负',
+        'over_under'      => '大小球',
+        'asian_handicap'  => '亚盘',
+        'next_goal'       => '下一进球',
+        default           => $type,
+    };
+}
+
+function rolling_type_icon(string $type): string
+{
+    return match ($type) {
+        'win_draw_lose'   => '⚽',
+        'over_under'      => '📊',
+        'asian_handicap'  => '🏆',
+        'next_goal'       => '🎯',
+        default           => '📌',
+    };
+}
+
+function format_kickoff(?string $kickoff): string
+{
+    if (empty($kickoff)) return '--';
+    try {
+        $dt = new DateTime($kickoff);
+        return $dt->format('m/d H:i');
+    } catch (\Throwable) {
+        return $kickoff;
     }
-    $localByMarket[$mkt][] = $p;
+}
+
+function display_score(?int $home, ?int $away): string
+{
+    if ($home === null || $away === null) return 'vs';
+    return "{$home} - {$away}";
+}
+
+function is_live(array $m): bool
+{
+    $s = strtoupper($m['status'] ?? '');
+    return in_array($s, ['LIVE', 'HT', '1H', '2H', 'FIRST_HALF', 'SECOND_HALF', 'HALFTIME'], true);
+}
+
+function is_finished(array $m): bool
+{
+    $s = strtoupper($m['status'] ?? '');
+    return in_array($s, ['FT', 'FINISHED', 'AET', 'PEN', 'FULL_TIME'], true);
+}
+
+function status_text(array $m): string
+{
+    $s = strtoupper($m['status'] ?? '');
+    return match ($s) {
+        'LIVE', '1H', 'FIRST_HALF'  => '● 进行中',
+        'HT', 'HALFTIME'            => '⏸ 中场',
+        '2H', 'SECOND_HALF'         => '● 下半场',
+        'FT', 'FINISHED', 'FULL_TIME' => '✓ 已结束',
+        'AET'                       => '✓ 加时',
+        'PEN'                       => '✓ 点球',
+        default                     => '未开始',
+    };
+}
+
+function kelly_color(?float $v): string
+{
+    if ($v === null) return 'kelly-neutral';
+    if ($v > 1.05) return 'kelly-high';
+    if ($v > 0.95) return 'kelly-good';
+    return 'kelly-low';
+}
+
+function kelly_label(?float $v): string
+{
+    if ($v === null) return '--';
+    if ($v > 1.05) return '✓ 有利';
+    if ($v > 0.95) return '≈ 持平';
+    return '✗ 不利';
 }
 
 // ---------------------------------------------------------------------------
-// 从 API 分析结果中提取各市场预测
+// 数据获取
 // ---------------------------------------------------------------------------
-$apiWinDrawLose  = $apiAnalysis['win_draw_lose']  ?? [];
-$apiOverUnder    = $apiAnalysis['over_under']      ?? [];
-$apiAsianHcp     = $apiAnalysis['asian_handicap']  ?? [];
-$apiPatterns     = $apiAnalysis['pattern_matches'] ?? [];
-$apiConfidence   = $apiAnalysis['overall_confidence_level'] ?? '';
-$apiBenefit      = $apiAnalysis['benefit_factors'] ?? [];
-$apiRisk         = $apiAnalysis['risk_factors']    ?? [];
-$apiPredScores   = $apiAnalysis['predicted_scores'] ?? [];
 
+$analysis = null;
+$kelly    = null;
+$rolling  = null;
+$error    = null;
+
+try {
+    $results = api_get_multi([
+        'analysis' => "match/{$matchId}/analysis",
+        'kelly'    => "match/{$matchId}/kelly",
+        'rolling'  => "match/{$matchId}/rolling",
+    ]);
+    $analysis = $results['analysis'];
+    $kelly    = $results['kelly'];
+    $rolling  = $results['rolling'];
+} catch (\Throwable $e) {
+    $error = $e->getMessage();
+}
+
+// 从 analysis 中提取 match 信息
+$match = $analysis['match'] ?? [];
+$live  = is_live($match);
+$finished = is_finished($match);
+
+// 预测数据
+$confidenceScore  = $analysis['confidence_score'] ?? 0;
+$confidenceLevel  = $analysis['overall_confidence_level'] ?? 'C';
+$benefitFactors   = $analysis['benefit_factors'] ?? [];
+$riskFactors      = $analysis['risk_factors'] ?? [];
+$preMatchNotes    = $analysis['pre_match_notes'] ?? [];
+$predictedScores  = $analysis['predicted_scores'] ?? [];
+$wdl              = $analysis['win_draw_lose'] ?? [];
+$ou               = $analysis['over_under'] ?? [];
+$ah               = $analysis['asian_handicap'] ?? [];
+$providerEvidence = $analysis['provider_evidence'] ?? [];
+$patternMatches   = $analysis['pattern_matches'] ?? [];
+$rollingPreds     = $analysis['rolling_predictions'] ?? [];
+
+// 凯利数据
+$kellyHome  = $kelly['home_kelly'] ?? null;
+$kellyDraw  = $kelly['draw_kelly'] ?? null;
+$kellyAway  = $kelly['away_kelly'] ?? null;
+$kellyOver  = $kelly['over_kelly'] ?? null;
+$kellyUnder = $kelly['under_kelly'] ?? null;
+$kellyAhH   = $kelly['asian_home_kelly'] ?? null;
+$kellyAhA   = $kelly['asian_away_kelly'] ?? null;
+$kellyCount = $kelly['bookmaker_count'] ?? 0;
+$kellyDetails = $kelly['bookmaker_details'] ?? [];
+
+// 推荐方向
+$recommendation = '';
+$recConfidence  = '';
+if (!empty($wdl)) {
+    $top = $wdl[0];
+    $recommendation = direction_badge('1x2', $top['label'] ?? '');
+    $recConfidence   = round(($top['probability'] ?? 0) * 100);
+}
 ?>
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?= e($match['home_team']) ?> vs <?= e($match['away_team']) ?> — 比赛详情</title>
-    <link rel="stylesheet" href="style.css">
-    <style>
-        /* ── 详情页补充样式 ── */
-        .detail-nav {
-            padding: 16px 0;
-            border-bottom: 1px solid rgba(255,255,255,0.06);
-            margin-bottom: 24px;
-        }
-        .detail-nav a {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            font-weight: 700;
-            font-size: 14px;
-            color: #8ea3bd;
-            transition: color 0.2s;
-        }
-        .detail-nav a:hover {
-            color: #7df48b;
-            text-decoration: none;
-        }
-
-        /* 比赛信息大卡片 */
-        .match-hero-card {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 20px;
-            padding: 32px 24px;
-            text-align: center;
-            margin-bottom: 28px;
-            backdrop-filter: blur(10px);
-        }
-        .match-hero-card .league-tag {
-            display: inline-block;
-            font-size: 11px;
-            font-weight: 800;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: #8ea3bd;
-            background: rgba(255,255,255,0.06);
-            padding: 4px 14px;
-            border-radius: 999px;
-            margin-bottom: 16px;
-        }
-        .match-hero-card .teams-row {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: clamp(16px, 4vw, 40px);
-            flex-wrap: wrap;
-        }
-        .match-hero-card .team-name {
-            font-size: clamp(20px, 4vw, 32px);
-            font-weight: 900;
-            color: #fff;
-            min-width: 120px;
-        }
-        .match-hero-card .score-display {
-            font-size: clamp(36px, 7vw, 56px);
-            font-weight: 950;
-            color: #7df48b;
-            line-height: 1;
-            letter-spacing: 0.02em;
-            min-width: 100px;
-        }
-        .match-hero-card .score-display.live-score {
-            animation: scorePulse 2s ease-in-out infinite;
-        }
-        @keyframes scorePulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
-        }
-        .match-hero-card .status-tag {
-            display: inline-block;
-            margin-top: 16px;
-            font-size: 13px;
-            font-weight: 800;
-            padding: 6px 18px;
-            border-radius: 999px;
-        }
-        .match-hero-card .status-tag.live {
-            background: rgba(125,244,139,0.16);
-            color: #7df48b;
-            border: 1px solid rgba(125,244,139,0.30);
-        }
-        .match-hero-card .status-tag.scheduled {
-            background: rgba(255,193,7,0.12);
-            color: #ffc107;
-            border: 1px solid rgba(255,193,7,0.25);
-        }
-        .match-hero-card .status-tag.finished {
-            background: rgba(142,163,189,0.12);
-            color: #8ea3bd;
-            border: 1px solid rgba(142,163,189,0.25);
-        }
-        .match-hero-card .kickoff-info {
-            margin-top: 12px;
-            font-size: 13px;
-            color: #8ea3bd;
-        }
-
-        /* 预测详情卡片 */
-        .prediction-detail-card {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 18px;
-            padding: 24px;
-            margin-bottom: 20px;
-            backdrop-filter: blur(10px);
-        }
-        .prediction-detail-card .card-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        .prediction-detail-card .card-header h3 {
-            margin: 0;
-            font-size: 18px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .prediction-detail-card .prediction-list {
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-        }
-        .prediction-detail-card .pred-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 14px 16px;
-            background: rgba(255,255,255,0.03);
-            border-radius: 12px;
-            border: 1px solid rgba(255,255,255,0.05);
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        .prediction-detail-card .pred-item.primary {
-            border-color: rgba(125,244,139,0.25);
-            background: rgba(125,244,139,0.06);
-        }
-        .prediction-detail-card .pred-label {
-            font-weight: 800;
-            color: #fff;
-            font-size: 15px;
-        }
-        .prediction-detail-card .pred-probability {
-            font-weight: 900;
-            font-size: 20px;
-            color: #7df48b;
-            min-width: 60px;
-            text-align: right;
-        }
-        .prediction-detail-card .pred-rationale {
-            width: 100%;
-            font-size: 13px;
-            color: #8ea3bd;
-            line-height: 1.6;
-            padding-top: 8px;
-            border-top: 1px solid rgba(255,255,255,0.04);
-        }
-
-        /* 概率条 */
-        .prob-bar-wrap {
-            flex: 1;
-            min-width: 120px;
-            height: 8px;
-            background: rgba(255,255,255,0.06);
-            border-radius: 999px;
-            overflow: hidden;
-            margin: 0 12px;
-        }
-        .prob-bar-fill {
-            height: 100%;
-            border-radius: 999px;
-            background: linear-gradient(90deg, #7df48b, #33b8ff);
-            transition: width 0.6s ease;
-        }
-
-        /* 折叠面板 */
-        .accordion {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 18px;
-            margin-bottom: 20px;
-            overflow: hidden;
-        }
-        .accordion-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 18px 24px;
-            cursor: pointer;
-            user-select: none;
-            transition: background 0.2s;
-        }
-        .accordion-header:hover {
-            background: rgba(255,255,255,0.03);
-        }
-        .accordion-header h3 {
-            margin: 0;
-            font-size: 16px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .accordion-header .arrow {
-            font-size: 12px;
-            color: #8ea3bd;
-            transition: transform 0.3s;
-        }
-        .accordion.open .accordion-header .arrow {
-            transform: rotate(180deg);
-        }
-        .accordion-body {
-            max-height: 0;
-            overflow: hidden;
-            transition: max-height 0.35s ease;
-        }
-        .accordion.open .accordion-body {
-            max-height: 2000px;
-        }
-        .accordion-body-inner {
-            padding: 0 24px 20px;
-        }
-
-        /* 模式匹配证据项 */
-        .pattern-item {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.06);
-            border-radius: 12px;
-            padding: 16px;
-            margin-bottom: 12px;
-        }
-        .pattern-item .pattern-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 10px;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .pattern-item .pattern-type {
-            font-weight: 800;
-            font-size: 13px;
-            color: #7df48b;
-            text-transform: uppercase;
-        }
-        .pattern-item .pattern-similarity {
-            font-weight: 800;
-            font-size: 13px;
-            color: #8ea3bd;
-        }
-        .pattern-item .pattern-desc {
-            font-size: 13px;
-            color: #edf7ff;
-            margin-bottom: 8px;
-        }
-        .pattern-item .pattern-evidence {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-        .pattern-item .pattern-evidence li {
-            font-size: 12px;
-            color: #8ea3bd;
-            padding: 3px 0;
-            padding-left: 16px;
-            position: relative;
-        }
-        .pattern-item .pattern-evidence li::before {
-            content: "•";
-            position: absolute;
-            left: 0;
-            color: #7df48b;
-        }
-        .pattern-item .pattern-conclusion {
-            margin-top: 10px;
-            padding: 10px 14px;
-            background: rgba(125,244,139,0.06);
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 700;
-            color: #7df48b;
-        }
-
-        /* 滚球预测卡片 */
-        .rolling-card {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(125,244,139,0.20);
-            border-radius: 18px;
-            padding: 20px;
-            margin-bottom: 16px;
-            backdrop-filter: blur(10px);
-        }
-        .rolling-card .rolling-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 12px;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .rolling-card .rolling-type {
-            font-weight: 800;
-            font-size: 13px;
-            color: #7df48b;
-            text-transform: uppercase;
-        }
-        .rolling-card .rolling-label {
-            font-weight: 900;
-            font-size: 16px;
-            color: #fff;
-        }
-        .rolling-card .rolling-prob {
-            font-weight: 900;
-            font-size: 22px;
-            color: #7df48b;
-        }
-        .rolling-card .rolling-rationale {
-            font-size: 13px;
-            color: #8ea3bd;
-            line-height: 1.6;
-            margin-top: 8px;
-            padding-top: 10px;
-            border-top: 1px solid rgba(255,255,255,0.05);
-        }
-
-        /* 利好/风险因子 */
-        .factor-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-top: 12px;
-        }
-        .factor-tag {
-            font-size: 12px;
-            font-weight: 700;
-            padding: 4px 12px;
-            border-radius: 999px;
-        }
-        .factor-tag.benefit {
-            background: rgba(125,244,139,0.12);
-            color: #7df48b;
-            border: 1px solid rgba(125,244,139,0.25);
-        }
-        .factor-tag.risk {
-            background: rgba(255,90,90,0.12);
-            color: #ff6b6b;
-            border: 1px solid rgba(255,90,90,0.25);
-        }
-
-        /* 比分预测 */
-        .score-pred-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-top: 12px;
-        }
-        .score-pred-item {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 10px;
-            padding: 8px 16px;
-            text-align: center;
-            font-weight: 800;
-            font-size: 14px;
-        }
-        .score-pred-item .sp-score {
-            color: #fff;
-        }
-        .score-pred-item .sp-prob {
-            color: #7df48b;
-            font-size: 12px;
-        }
-
-        /* 无数据 */
-        .no-data {
-            text-align: center;
-            padding: 40px 20px;
-            color: #8ea3bd;
-            font-size: 14px;
-        }
-
-        /* API 错误提示 */
-        .api-error {
-            background: rgba(255,90,90,0.08);
-            border: 1px solid rgba(255,90,90,0.20);
-            border-radius: 12px;
-            padding: 12px 16px;
-            margin-bottom: 20px;
-            font-size: 13px;
-            color: #ff6b6b;
-        }
-
-        /* 响应式 */
-        @media (max-width: 600px) {
-            .match-hero-card .teams-row {
-                flex-direction: column;
-                gap: 12px;
-            }
-            .prediction-detail-card .pred-item {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .prob-bar-wrap {
-                width: 100%;
-                margin: 4px 0;
-            }
-        }
-    </style>
+    <title><?= e($match['home_team']['name'] ?? $match['home_team'] ?? '?') ?> vs <?= e($match['away_team']['name'] ?? $match['away_team'] ?? '?') ?> — 比赛详情</title>
+    <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
-<!-- ═══════════════════════════════════════════ -->
-<!--  顶部导航                                    -->
-<!-- ═══════════════════════════════════════════ -->
-<div class="container">
-    <nav class="detail-nav">
-        <a href="index.php">← 返回首页</a>
-    </nav>
-</div>
-
-<!-- ═══════════════════════════════════════════ -->
-<!--  比赛信息大卡片                              -->
-<!-- ═══════════════════════════════════════════ -->
-<section class="container">
-    <div class="match-hero-card" id="matchHero">
-        <div class="league-tag"><?= e($match['league']) ?></div>
-        <div class="teams-row">
-            <span class="team-name"><?= e($match['home_team']) ?></span>
-            <span class="score-display <?= $isLive ? 'live-score' : '' ?>" id="liveScore">
-                <?= display_score(
-                    $homeScore !== null ? (int)$homeScore : null,
-                    $awayScore !== null ? (int)$awayScore : null
-                ) ?>
-            </span>
-            <span class="team-name"><?= e($match['away_team']) ?></span>
-        </div>
-        <div>
-            <span class="status-tag <?= $isLive ? 'live' : ($isFinished ? 'finished' : 'scheduled') ?>">
-                <?= match_status_text($matchStatus) ?>
-            </span>
-        </div>
-        <div class="kickoff-info">
-            📅 开赛时间：<?= format_kickoff($match['kickoff']) ?>
+<nav class="navbar">
+    <div class="container">
+        <a href="/" class="navbar-brand">⚽ 足球智能预测</a>
+        <div class="navbar-links">
+            <a href="/">← 返回首页</a>
         </div>
     </div>
-</section>
+</nav>
 
-<!-- ═══════════════════════════════════════════ -->
-<!--  API 错误提示                               -->
-<!-- ═══════════════════════════════════════════ -->
-<?php if ($apiError !== null): ?>
-<section class="container">
+<main class="container">
+
+<?php if ($error !== null): ?>
     <div class="api-error">
-        ⚠️ API 数据获取失败：<?= e($apiError) ?>（以下展示本地缓存数据）
+        <strong>数据加载失败</strong>
+        <p><?= e($error) ?></p>
+        <a href="/" class="btn btn-outline">返回首页</a>
     </div>
-</section>
-<?php endif; ?>
+<?php else: ?>
 
-<!-- ═══════════════════════════════════════════ -->
-<!--  综合信心 & 因子                            -->
-<!-- ═══════════════════════════════════════════ -->
-<?php if ($apiConfidence !== '' || !empty($apiBenefit) || !empty($apiRisk)): ?>
-<section class="container">
-    <div class="prediction-detail-card">
-        <div class="card-header">
-            <h3>📊 综合分析</h3>
-            <?php if ($apiConfidence !== ''): ?>
-            <span class="<?= confidence_level_class($apiConfidence) ?>">
-                <?= confidence_level_text($apiConfidence) ?> (<?= e($apiConfidence) ?>)
-            </span>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- 比赛 Hero 卡片                                                      -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <div class="match-hero <?= $live ? 'match-hero-live' : ($finished ? 'match-hero-finished' : '') ?>">
+        <div class="match-hero-league"><?= e($match['league'] ?? '未知联赛') ?></div>
+        <div class="match-hero-teams">
+            <div class="match-hero-team match-hero-home">
+                <span class="team-name"><?= e($match['home_team']['name'] ?? $match['home_team'] ?? '?') ?></span>
+            </div>
+            <div class="match-hero-score">
+                <span class="score-display"><?= display_score($match['home_score'] ?? null, $match['away_score'] ?? null) ?></span>
+                <?php if ($live && isset($match['minute'])): ?>
+                    <span class="live-minute"><?= (int)$match['minute'] ?>′</span>
+                <?php endif; ?>
+                <span class="match-status-badge"><?= status_text($match) ?></span>
+            </div>
+            <div class="match-hero-team match-hero-away">
+                <span class="team-name"><?= e($match['away_team']['name'] ?? $match['away_team'] ?? '?') ?></span>
+            </div>
+        </div>
+        <div class="match-hero-meta">
+            <span>开赛：<?= format_kickoff($match['kickoff'] ?? null) ?></span>
+            <?php if (!empty($match['id'])): ?>
+                <span class="match-id">ID: <?= e($match['id']) ?></span>
             <?php endif; ?>
         </div>
-        <?php if (!empty($apiBenefit)): ?>
-        <div style="margin-bottom: 8px;">
-            <strong style="font-size:13px;color:#7df48b;">✅ 利好因子</strong>
-            <div class="factor-list">
-                <?php foreach ($apiBenefit as $f): ?>
-                <span class="factor-tag benefit"><?= e($f) ?></span>
-                <?php endforeach; ?>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- 🎯 预测结果 (置顶)                                                   -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <section class="section">
+        <h2 class="section-title">🎯 综合预测</h2>
+
+        <!-- 信心 + 推荐 -->
+        <div class="prediction-summary">
+            <div class="confidence-badge <?= confidence_class($confidenceLevel) ?>">
+                <span class="confidence-letter"><?= e(strtoupper($confidenceLevel)) ?></span>
+                <span class="confidence-label"><?= confidence_text($confidenceLevel) ?></span>
             </div>
-        </div>
-        <?php endif; ?>
-        <?php if (!empty($apiRisk)): ?>
-        <div>
-            <strong style="font-size:13px;color:#ff6b6b;">⚠️ 风险因子</strong>
-            <div class="factor-list">
-                <?php foreach ($apiRisk as $f): ?>
-                <span class="factor-tag risk"><?= e($f) ?></span>
-                <?php endforeach; ?>
+            <div class="confidence-score-bar">
+                <div class="score-bar-fill" style="width: <?= min(100, max(0, $confidenceScore)) ?>%"></div>
             </div>
-        </div>
-        <?php endif; ?>
-        <?php if (!empty($apiPredScores)): ?>
-        <div style="margin-top: 14px;">
-            <strong style="font-size:13px;color:#8ea3bd;">🎯 比分预测</strong>
-            <div class="score-pred-list">
-                <?php foreach ($apiPredScores as $sp): ?>
-                <div class="score-pred-item">
-                    <span class="sp-score"><?= e($sp['score'] ?? '') ?></span>
-                    <br>
-                    <span class="sp-prob"><?= percent_fmt($sp['probability'] ?? 0) ?></span>
+            <div class="confidence-score-text">综合评分 <?= round($confidenceScore, 1) ?>/100</div>
+            <?php if ($recommendation !== ''): ?>
+                <div class="recommendation-badge">
+                    推荐：<strong><?= e($recommendation) ?></strong>
+                    <?php if ($recConfidence > 0): ?>
+                        <span class="rec-prob">(<?= $recConfidence ?>%)</span>
+                    <?php endif; ?>
                 </div>
-                <?php endforeach; ?>
-            </div>
-        </div>
-        <?php endif; ?>
-    </div>
-</section>
-<?php endif; ?>
-
-<!-- ═══════════════════════════════════════════ -->
-<!--  三大市场预测详情                            -->
-<!-- ═══════════════════════════════════════════ -->
-
-<?php
-// 构建市场数据：优先使用 API 数据，回退到本地数据
-$markets = [
-    '1x2' => [
-        'icon'   => '⚽',
-        'title'  => '胜平负预测',
-        'api'    => $apiWinDrawLose,
-        'local'  => $localByMarket['1x2'] ?? [],
-    ],
-    'over_under' => [
-        'icon'   => '📐',
-        'title'  => '大小球预测',
-        'api'    => $apiOverUnder,
-        'local'  => $localByMarket['over_under'] ?? [],
-    ],
-    'asian_handicap' => [
-        'icon'   => '📏',
-        'title'  => '亚盘预测',
-        'api'    => $apiAsianHcp,
-        'local'  => $localByMarket['asian_handicap'] ?? [],
-    ],
-];
-
-foreach ($markets as $mktKey => $mktData):
-    $apiPreds  = $mktData['api'];
-    $localPreds = $mktData['local'];
-
-    // 找到最高概率项作为 primary
-    $maxProb = 0.0;
-    $primaryIdx = -1;
-    foreach ($apiPreds as $i => $ap) {
-        $prob = (float)($ap['probability'] ?? 0);
-        if ($prob > $maxProb) {
-            $maxProb = $prob;
-            $primaryIdx = $i;
-        }
-    }
-?>
-<section class="container">
-    <div class="prediction-detail-card">
-        <div class="card-header">
-            <h3><?= $mktData['icon'] ?> <?= $mktData['title'] ?></h3>
-            <?php if (!empty($localPreds)): ?>
-            <span style="font-size:12px;color:#8ea3bd;">
-                <?= count($localPreds) ?> 条本地记录
-            </span>
             <?php endif; ?>
         </div>
 
-        <?php if (!empty($apiPreds)): ?>
-        <!-- API 预测数据 -->
-        <div class="prediction-list">
-            <?php foreach ($apiPreds as $i => $ap):
-                $prob  = (float)($ap['probability'] ?? 0);
-                $label = $ap['label'] ?? '';
-                $rationale = $ap['rationale'] ?? '';
-                $isPrimary = ($i === $primaryIdx && $maxProb > 0);
+        <!-- 三大市场预测 -->
+        <div class="market-predictions-grid">
+            <?php
+            $markets = [
+                ['title' => '胜平负', 'key' => '1x2', 'items' => $wdl],
+                ['title' => '大小球', 'key' => 'over_under', 'items' => $ou],
+                ['title' => '亚盘',   'key' => 'asian_handicap', 'items' => $ah],
+            ];
+            foreach ($markets as $mkt):
             ?>
-            <div class="pred-item <?= $isPrimary ? 'primary' : '' ?>">
-                <span class="pred-label">
-                    <?= $isPrimary ? '⭐ ' : '' ?><?= e($label) ?>
-                </span>
-                <div class="prob-bar-wrap">
-                    <div class="prob-bar-fill" style="width:<?= min($prob, 100) ?>%;"></div>
-                </div>
-                <span class="pred-probability"><?= percent_fmt($prob) ?></span>
-                <?php if ($rationale !== ''): ?>
-                <div class="pred-rationale"><?= e($rationale) ?></div>
+            <div class="market-card">
+                <h3 class="market-card-title"><?= $mkt['title'] ?></h3>
+                <?php if (empty($mkt['items'])): ?>
+                    <div class="text-muted">暂无数据</div>
+                <?php else: ?>
+                    <?php foreach ($mkt['items'] as $pred): ?>
+                        <?php $prob = round(($pred['probability'] ?? 0) * 100); ?>
+                        <div class="market-prediction-row">
+                            <span class="mp-label"><?= e(direction_badge($mkt['key'], $pred['label'] ?? '')) ?></span>
+                            <div class="mp-bar-track">
+                                <div class="mp-bar-fill" style="width: <?= $prob ?>%"></div>
+                            </div>
+                            <span class="mp-prob"><?= $prob ?>%</span>
+                        </div>
+                        <?php if (!empty($pred['rationale'])): ?>
+                            <div class="mp-rationale"><?= e($pred['rationale']) ?></div>
+                        <?php endif; ?>
+                    <?php endforeach; ?>
                 <?php endif; ?>
             </div>
             <?php endforeach; ?>
         </div>
-        <?php elseif (!empty($localPreds)): ?>
-        <!-- 回退：本地预测数据 -->
-        <div class="prediction-list">
-            <?php foreach ($localPreds as $lp):
-                $conf = (float)($lp['confidence'] ?? 0);
-                $dir  = $lp['direction'] ?? '';
-                $odds = $lp['odds'] ?? null;
-                $summary = $lp['free_summary'] ?? '';
-            ?>
-            <div class="pred-item">
-                <span class="pred-label"><?= direction_badge($mktKey, $dir) ?></span>
-                <div class="prob-bar-wrap">
-                    <div class="prob-bar-fill" style="width:<?= min($conf, 100) ?>%;"></div>
-                </div>
-                <span class="pred-probability"><?= number_format($conf, 1) ?>%</span>
-                <?php if ($odds): ?>
-                <span style="font-size:13px;color:#8ea3bd;">赔率 <?= number_format((float)$odds, 2) ?></span>
-                <?php endif; ?>
-                <?php if ($summary !== '' && $summary !== null): ?>
-                <div class="pred-rationale"><?= e($summary) ?></div>
-                <?php endif; ?>
+
+        <!-- 比分预测 -->
+        <?php if (!empty($predictedScores)): ?>
+        <div class="score-predictions">
+            <h3 class="subsection-title">📊 比分预测</h3>
+            <div class="score-prediction-list">
+                <?php foreach (array_slice($predictedScores, 0, 5) as $sp): ?>
+                    <div class="score-prediction-item">
+                        <span class="sp-score"><?= e($sp['score'] ?? '?') ?></span>
+                        <div class="sp-bar-track">
+                            <div class="sp-bar-fill" style="width: <?= round(($sp['probability'] ?? 0) * 100) ?>%"></div>
+                        </div>
+                        <span class="sp-prob"><?= round(($sp['probability'] ?? 0) * 100) ?>%</span>
+                    </div>
+                <?php endforeach; ?>
             </div>
+        </div>
+        <?php endif; ?>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- 📋 预测溯源证据                                                      -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <section class="section">
+        <h2 class="section-title">📋 预测溯源</h2>
+
+        <!-- 有利因素 / 风险因素 -->
+        <div class="evidence-grid">
+            <?php if (!empty($benefitFactors)): ?>
+            <div class="evidence-card evidence-benefit">
+                <h3 class="evidence-title benefit-title">✅ 有利因素</h3>
+                <ul class="evidence-list">
+                    <?php foreach ($benefitFactors as $f): ?>
+                        <li><?= e($f) ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+            <?php endif; ?>
+
+            <?php if (!empty($riskFactors)): ?>
+            <div class="evidence-card evidence-risk">
+                <h3 class="evidence-title risk-title">⚠️ 风险因素</h3>
+                <ul class="evidence-list">
+                    <?php foreach ($riskFactors as $f): ?>
+                        <li><?= e($f) ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+            <?php endif; ?>
+        </div>
+
+        <!-- 赛前分析备注 -->
+        <?php if (!empty($preMatchNotes)): ?>
+        <div class="evidence-card evidence-notes">
+            <h3 class="evidence-title">📝 赛前分析</h3>
+            <ul class="evidence-list">
+                <?php foreach ($preMatchNotes as $n): ?>
+                    <li><?= e($n) ?></li>
+                <?php endforeach; ?>
+            </ul>
+        </div>
+        <?php endif; ?>
+
+        <!-- 模式匹配证据 -->
+        <?php if (!empty($patternMatches)): ?>
+        <div class="evidence-card evidence-patterns">
+            <h3 class="evidence-title">🔍 模式匹配分析</h3>
+            <?php foreach ($patternMatches as $pm): ?>
+                <div class="pattern-match-item">
+                    <div class="pm-header">
+                        <span class="pm-type"><?= pattern_type_label($pm['pattern_type'] ?? '') ?></span>
+                        <?php if (isset($pm['similarity'])): ?>
+                            <span class="pm-similarity">相似度 <?= round($pm['similarity'], 1) ?>%</span>
+                        <?php endif; ?>
+                    </div>
+                    <?php if (!empty($pm['description'])): ?>
+                        <p class="pm-description"><?= e($pm['description']) ?></p>
+                    <?php endif; ?>
+                    <?php if (!empty($pm['evidence'])): ?>
+                        <ul class="evidence-list pm-evidence">
+                            <?php foreach ($pm['evidence'] as $ev): ?>
+                                <li><?= e($ev) ?></li>
+                            <?php endforeach; ?>
+                        </ul>
+                    <?php endif; ?>
+                    <?php if (!empty($pm['conclusion'])): ?>
+                        <div class="pm-conclusion">💡 <?= e($pm['conclusion']) ?></div>
+                    <?php endif; ?>
+                    <?php if (isset($pm['derived_line']) || isset($pm['market_line'])): ?>
+                        <div class="pm-lines">
+                            <?php if (isset($pm['derived_line'])): ?>
+                                <span>推导盘口：<strong><?= e((string)$pm['derived_line']) ?></strong></span>
+                            <?php endif; ?>
+                            <?php if (isset($pm['market_line'])): ?>
+                                <span>市场盘口：<strong><?= e((string)$pm['market_line']) ?></strong></span>
+                            <?php endif; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
             <?php endforeach; ?>
         </div>
-        <?php else: ?>
-        <div class="no-data">暂无该市场预测数据</div>
         <?php endif; ?>
-    </div>
-</section>
-<?php endforeach; ?>
 
-<!-- ═══════════════════════════════════════════ -->
-<!--  模式匹配证据（折叠面板）                     -->
-<!-- ═══════════════════════════════════════════ -->
-<?php if (!empty($apiPatterns)): ?>
-<section class="container">
-    <div class="accordion" id="patternAccordion">
-        <div class="accordion-header" onclick="toggleAccordion('patternAccordion')">
-            <h3>🔬 历史模式匹配证据 <span style="font-size:12px;color:#8ea3bd;font-weight:400;">(<?= count($apiPatterns) ?> 条)</span></h3>
-            <span class="arrow">▼</span>
+        <!-- 数据来源证据 -->
+        <?php if (!empty($providerEvidence)): ?>
+        <div class="evidence-card evidence-providers">
+            <h3 class="evidence-title">📡 数据来源</h3>
+            <ul class="evidence-list">
+                <?php foreach ($providerEvidence as $pe): ?>
+                    <li><?= e($pe) ?></li>
+                <?php endforeach; ?>
+            </ul>
         </div>
-        <div class="accordion-body">
-            <div class="accordion-body-inner">
-                <?php foreach ($apiPatterns as $pm):
-                    $patternType = $pm['pattern_type'] ?? '';
-                    $desc        = $pm['description'] ?? '';
-                    $similarity  = (float)($pm['similarity'] ?? 0);
-                    $evidence    = $pm['evidence'] ?? [];
-                    $derivedLine = $pm['derived_line'] ?? null;
-                    $marketLine  = $pm['market_line'] ?? null;
-                    $conclusion  = $pm['conclusion'] ?? '';
-                ?>
-                <div class="pattern-item">
-                    <div class="pattern-header">
-                        <span class="pattern-type">
-                            <?= match ($patternType) {
-                                'handicap_derivation' => '📐 让球推导',
-                                'odds_implied'        => '📊 欧赔隐含概率',
-                                'asian_water'         => '💧 亚盘水位分析',
-                                'totals'              => '⚽ 大小球预期',
-                                default               => e($patternType),
-                            } ?>
-                        </span>
-                        <span class="pattern-similarity">
-                            相似度：<?= number_format($similarity, 1) ?>%
-                        </span>
-                    </div>
-                    <?php if ($desc !== ''): ?>
-                    <div class="pattern-desc"><?= e($desc) ?></div>
-                    <?php endif; ?>
-                    <?php if ($derivedLine !== null || $marketLine !== null): ?>
-                    <div style="font-size:12px;color:#8ea3bd;margin-bottom:8px;">
-                        <?php if ($derivedLine !== null): ?>
-                        推导盘口：<strong style="color:#7df48b;"><?= e((string)$derivedLine) ?></strong>
+        <?php endif; ?>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- 📊 详细数据 (折叠面板)                                                -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <section class="section">
+        <h2 class="section-title">📊 详细数据</h2>
+
+        <div class="accordion">
+
+            <!-- 凯利指数 -->
+            <div class="accordion-item">
+                <button class="accordion-trigger" onclick="this.parentElement.classList.toggle('open')">
+                    <span>📈 凯利指数</span>
+                    <span class="accordion-arrow">▾</span>
+                </button>
+                <div class="accordion-panel">
+                    <?php if ($kellyCount > 0): ?>
+                        <div class="kelly-grid">
+                            <div class="kelly-card <?= kelly_color($kellyHome) ?>">
+                                <div class="kelly-label">主胜</div>
+                                <div class="kelly-value"><?= $kellyHome !== null ? number_format($kellyHome, 4) : '--' ?></div>
+                                <div class="kelly-status"><?= kelly_label($kellyHome) ?></div>
+                            </div>
+                            <div class="kelly-card <?= kelly_color($kellyDraw) ?>">
+                                <div class="kelly-label">平局</div>
+                                <div class="kelly-value"><?= $kellyDraw !== null ? number_format($kellyDraw, 4) : '--' ?></div>
+                                <div class="kelly-status"><?= kelly_label($kellyDraw) ?></div>
+                            </div>
+                            <div class="kelly-card <?= kelly_color($kellyAway) ?>">
+                                <div class="kelly-label">客胜</div>
+                                <div class="kelly-value"><?= $kellyAway !== null ? number_format($kellyAway, 4) : '--' ?></div>
+                                <div class="kelly-status"><?= kelly_label($kellyAway) ?></div>
+                            </div>
+                            <div class="kelly-card <?= kelly_color($kellyOver) ?>">
+                                <div class="kelly-label">大球</div>
+                                <div class="kelly-value"><?= $kellyOver !== null ? number_format($kellyOver, 4) : '--' ?></div>
+                                <div class="kelly-status"><?= kelly_label($kellyOver) ?></div>
+                            </div>
+                            <div class="kelly-card <?= kelly_color($kellyUnder) ?>">
+                                <div class="kelly-label">小球</div>
+                                <div class="kelly-value"><?= $kellyUnder !== null ? number_format($kellyUnder, 4) : '--' ?></div>
+                                <div class="kelly-status"><?= kelly_label($kellyUnder) ?></div>
+                            </div>
+                            <div class="kelly-card <?= kelly_color($kellyAhH) ?>">
+                                <div class="kelly-label">亚盘主</div>
+                                <div class="kelly-value"><?= $kellyAhH !== null ? number_format($kellyAhH, 4) : '--' ?></div>
+                                <div class="kelly-status"><?= kelly_label($kellyAhH) ?></div>
+                            </div>
+                            <div class="kelly-card <?= kelly_color($kellyAhA) ?>">
+                                <div class="kelly-label">亚盘客</div>
+                                <div class="kelly-value"><?= $kellyAhA !== null ? number_format($kellyAhA, 4) : '--' ?></div>
+                                <div class="kelly-status"><?= kelly_label($kellyAhA) ?></div>
+                            </div>
+                        </div>
+                        <div class="kelly-source">基于 <?= $kellyCount ?> 家博彩公司数据计算</div>
+
+                        <?php if (!empty($kellyDetails)): ?>
+                        <div class="kelly-details-table-wrap">
+                            <table class="kelly-details-table">
+                                <thead>
+                                    <tr>
+                                        <th>博彩公司</th>
+                                        <th>主胜</th>
+                                        <th>平局</th>
+                                        <th>客胜</th>
+                                        <th>大球</th>
+                                        <th>小球</th>
+                                        <th>亚盘主</th>
+                                        <th>亚盘客</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($kellyDetails as $kd): ?>
+                                    <tr>
+                                        <td><?= e($kd['bookmaker'] ?? '--') ?></td>
+                                        <td class="<?= kelly_color($kd['home_kelly'] ?? null) ?>"><?= isset($kd['home_kelly']) ? number_format($kd['home_kelly'], 4) : '--' ?></td>
+                                        <td class="<?= kelly_color($kd['draw_kelly'] ?? null) ?>"><?= isset($kd['draw_kelly']) ? number_format($kd['draw_kelly'], 4) : '--' ?></td>
+                                        <td class="<?= kelly_color($kd['away_kelly'] ?? null) ?>"><?= isset($kd['away_kelly']) ? number_format($kd['away_kelly'], 4) : '--' ?></td>
+                                        <td class="<?= kelly_color($kd['over_kelly'] ?? null) ?>"><?= isset($kd['over_kelly']) ? number_format($kd['over_kelly'], 4) : '--' ?></td>
+                                        <td class="<?= kelly_color($kd['under_kelly'] ?? null) ?>"><?= isset($kd['under_kelly']) ? number_format($kd['under_kelly'], 4) : '--' ?></td>
+                                        <td class="<?= kelly_color($kd['asian_home_kelly'] ?? null) ?>"><?= isset($kd['asian_home_kelly']) ? number_format($kd['asian_home_kelly'], 4) : '--' ?></td>
+                                        <td class="<?= kelly_color($kd['asian_away_kelly'] ?? null) ?>"><?= isset($kd['asian_away_kelly']) ? number_format($kd['asian_away_kelly'], 4) : '--' ?></td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
                         <?php endif; ?>
-                        <?php if ($marketLine !== null): ?>
-                        &nbsp;|&nbsp; 市场盘口：<strong style="color:#edf7ff;"><?= e((string)$marketLine) ?></strong>
+                    <?php else: ?>
+                        <div class="text-muted">暂无凯利指数数据</div>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <!-- 近期战绩 -->
+            <?php
+            $homeForm = $match['home_recent_form'] ?? null;
+            $awayForm = $match['away_recent_form'] ?? null;
+            ?>
+            <?php if ($homeForm || $awayForm): ?>
+            <div class="accordion-item">
+                <button class="accordion-trigger" onclick="this.parentElement.classList.toggle('open')">
+                    <span>📋 近期战绩</span>
+                    <span class="accordion-arrow">▾</span>
+                </button>
+                <div class="accordion-panel">
+                    <div class="form-grid">
+                        <?php if ($homeForm): ?>
+                        <div class="form-card">
+                            <h4><?= e($match['home_team']['name'] ?? $match['home_team'] ?? '主队') ?> (主)</h4>
+                            <?php if (!empty($homeForm['results'])): ?>
+                                <div class="form-results">
+                                    <?php foreach ($homeForm['results'] as $r): ?>
+                                        <span class="form-badge form-<?= strtolower($r) ?>"><?= e($r) ?></span>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                            <?php if (!empty($homeForm['summary'])): ?>
+                                <p class="form-summary"><?= e($homeForm['summary']) ?></p>
+                            <?php endif; ?>
+                        </div>
+                        <?php endif; ?>
+                        <?php if ($awayForm): ?>
+                        <div class="form-card">
+                            <h4><?= e($match['away_team']['name'] ?? $match['away_team'] ?? '客队') ?> (客)</h4>
+                            <?php if (!empty($awayForm['results'])): ?>
+                                <div class="form-results">
+                                    <?php foreach ($awayForm['results'] as $r): ?>
+                                        <span class="form-badge form-<?= strtolower($r) ?>"><?= e($r) ?></span>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                            <?php if (!empty($awayForm['summary'])): ?>
+                                <p class="form-summary"><?= e($awayForm['summary']) ?></p>
+                            <?php endif; ?>
+                        </div>
                         <?php endif; ?>
                     </div>
-                    <?php endif; ?>
-                    <?php if (!empty($evidence)): ?>
-                    <ul class="pattern-evidence">
-                        <?php foreach ($evidence as $ev): ?>
-                        <li><?= e($ev) ?></li>
+                </div>
+            </div>
+            <?php endif; ?>
+
+            <!-- 交锋历史 -->
+            <?php $h2h = $match['h2h_summary'] ?? []; ?>
+            <?php if (!empty($h2h)): ?>
+            <div class="accordion-item">
+                <button class="accordion-trigger" onclick="this.parentElement.classList.toggle('open')">
+                    <span>🤝 交锋历史</span>
+                    <span class="accordion-arrow">▾</span>
+                </button>
+                <div class="accordion-panel">
+                    <ul class="h2h-list">
+                        <?php foreach ($h2h as $h): ?>
+                            <li class="h2h-item"><?= e($h) ?></li>
                         <?php endforeach; ?>
                     </ul>
-                    <?php endif; ?>
-                    <?php if ($conclusion !== ''): ?>
-                    <div class="pattern-conclusion">💡 <?= e($conclusion) ?></div>
-                    <?php endif; ?>
                 </div>
-                <?php endforeach; ?>
             </div>
-        </div>
-    </div>
-</section>
-<?php endif; ?>
+            <?php endif; ?>
 
-<!-- ═══════════════════════════════════════════ -->
-<!--  滚球预测区（仅进行中比赛）                   -->
-<!-- ═══════════════════════════════════════════ -->
-<?php if ($isLive): ?>
-<section class="container" id="rollingSection">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
-        <h2 style="margin:0;">🔄 滚球实时预测</h2>
-        <span style="font-size:12px;color:#8ea3bd;" id="rollingUpdateTime"></span>
-    </div>
-
-    <div id="rollingContainer">
-        <?php if (!empty($rollingData)): ?>
-            <?php foreach ($rollingData as $rp):
-                $rpType    = $rp['prediction_type'] ?? '';
-                $rpLabel   = $rp['label'] ?? '';
-                $rpProb    = (float)($rp['probability'] ?? 0);
-                $rpRationale = $rp['rationale'] ?? '';
-                $rpConf    = $rp['confidence_level'] ?? 'C';
+            <!-- 赔率对比 -->
+            <?php
+            $oddsData = $match['odds'] ?? null;
+            $homeOdds = $oddsData['home'] ?? [];
+            $drawOdds = $oddsData['draw'] ?? [];
+            $awayOdds = $oddsData['away'] ?? [];
+            $hasOdds = !empty($homeOdds) || !empty($drawOdds) || !empty($awayOdds);
             ?>
-            <div class="rolling-card">
-                <div class="rolling-header">
-                    <span class="rolling-type">
-                        <?= match ($rpType) {
-                            'win_draw_lose'   => '⚽ 胜平负',
-                            'over_under'      => '📐 大小球',
-                            'asian_handicap'  => '📏 亚盘',
-                            'next_goal'       => '🎯 下一进球方',
-                            default           => e($rpType),
-                        } ?>
-                    </span>
-                    <span class="<?= confidence_level_class($rpConf) ?>">
-                        <?= confidence_level_text($rpConf) ?>
-                    </span>
+            <?php if ($hasOdds): ?>
+            <div class="accordion-item">
+                <button class="accordion-trigger" onclick="this.parentElement.classList.toggle('open')">
+                    <span>💰 赔率对比</span>
+                    <span class="accordion-arrow">▾</span>
+                </button>
+                <div class="accordion-panel">
+                    <div class="odds-table-wrap">
+                        <table class="odds-table">
+                            <thead>
+                                <tr>
+                                    <th>博彩公司</th>
+                                    <th>主胜</th>
+                                    <th>平局</th>
+                                    <th>客胜</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php
+                                $maxRows = max(count($homeOdds), count($drawOdds), count($awayOdds));
+                                for ($i = 0; $i < $maxRows; $i++):
+                                    $ho = $homeOdds[$i] ?? null;
+                                    $do = $drawOdds[$i] ?? null;
+                                    $ao = $awayOdds[$i] ?? null;
+                                    $bookmaker = $ho['bookmaker'] ?? $do['bookmaker'] ?? $ao['bookmaker'] ?? '--';
+                                ?>
+                                <tr>
+                                    <td><?= e($bookmaker) ?></td>
+                                    <td><?= isset($ho['price']) ? number_format($ho['price'], 2) : '--' ?></td>
+                                    <td><?= isset($do['price']) ? number_format($do['price'], 2) : '--' ?></td>
+                                    <td><?= isset($ao['price']) ? number_format($ao['price'], 2) : '--' ?></td>
+                                </tr>
+                                <?php endfor; ?>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
-                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
-                    <span class="rolling-label"><?= e($rpLabel) ?></span>
-                    <span class="rolling-prob"><?= percent_fmt($rpProb) ?></span>
-                </div>
-                <?php if ($rpRationale !== ''): ?>
-                <div class="rolling-rationale"><?= e($rpRationale) ?></div>
-                <?php endif; ?>
             </div>
-            <?php endforeach; ?>
-        <?php else: ?>
-        <div class="no-data">滚球预测数据加载中...</div>
-        <?php endif; ?>
-    </div>
-</section>
+            <?php endif; ?>
+        </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- 🔄 滚球预测 (仅进行中比赛)                                            -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <?php if ($live): ?>
+    <section class="section" id="rolling-section">
+        <h2 class="section-title">
+            🔄 滚球预测
+            <span class="live-dot"></span>
+            <span class="refresh-indicator" id="rolling-refresh-indicator"></span>
+        </h2>
+        <div id="rolling-container">
+            <?php if (!empty($rollingPreds)): ?>
+                <div class="rolling-grid">
+                    <?php foreach ($rollingPreds as $rp): ?>
+                        <div class="rolling-card <?= confidence_class($rp['confidence_level'] ?? 'C') ?>">
+                            <div class="rolling-card-header">
+                                <span class="rolling-type-icon"><?= rolling_type_icon($rp['prediction_type'] ?? '') ?></span>
+                                <span class="rolling-type"><?= rolling_type_label($rp['prediction_type'] ?? '') ?></span>
+                                <span class="rolling-confidence <?= confidence_class($rp['confidence_level'] ?? 'C') ?>">
+                                    <?= e(strtoupper($rp['confidence_level'] ?? 'C')) ?>
+                                </span>
+                            </div>
+                            <div class="rolling-card-body">
+                                <div class="rolling-label"><?= e(direction_badge($rp['prediction_type'] ?? '', $rp['label'] ?? '')) ?></div>
+                                <?php if (isset($rp['probability'])): ?>
+                                    <div class="rolling-prob"><?= round($rp['probability'] * 100) ?>%</div>
+                                <?php endif; ?>
+                            </div>
+                            <?php if (!empty($rp['rationale'])): ?>
+                                <div class="rolling-rationale"><?= e($rp['rationale']) ?></div>
+                            <?php endif; ?>
+                            <div class="rolling-card-footer">
+                                <span><?= (int)($rp['minute'] ?? 0) ?>′</span>
+                                <span><?= e($rp['current_score'] ?? '') ?></span>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            <?php else: ?>
+                <div class="text-muted">暂无滚球预测数据</div>
+            <?php endif; ?>
+        </div>
+    </section>
+    <?php endif; ?>
+
 <?php endif; ?>
 
-<!-- ═══════════════════════════════════════════ -->
-<!--  页脚                                        -->
-<!-- ═══════════════════════════════════════════ -->
-<footer style="text-align:center;padding:40px 20px;color:#8ea3bd;font-size:12px;border-top:1px solid rgba(255,255,255,0.06);margin-top:40px;">
-    <p>数据来源：football-data.org · The Odds API · Goalserve · 500.com · 足彩网 · njstats.cn</p>
-    <p>预测仅供参考，不构成投注建议。</p>
+</main>
+
+<footer class="footer">
+    <div class="container">
+        <p>足球智能预测系统 · 数据仅供参考</p>
+    </div>
 </footer>
 
-<!-- ═══════════════════════════════════════════ -->
-<!--  JavaScript                                -->
-<!-- ═══════════════════════════════════════════ -->
+<?php if ($live): ?>
 <script>
-// ── 折叠面板切换 ──
-function toggleAccordion(id) {
-    var el = document.getElementById(id);
-    if (el) {
-        el.classList.toggle('open');
-    }
-}
-
-<?php if ($isLive): ?>
-// ── 实时比分 AJAX 轮询 ──
 (function() {
-    var matchId    = <?= json_encode($matchId, JSON_UNESCAPED_SLASHES) ?>;
-    var pollTimer  = null;
-    var POLL_INTERVAL = 30000; // 30 秒
+    var matchId = <?= json_encode($matchId) ?>;
+    var container = document.getElementById('rolling-container');
+    var indicator = document.getElementById('rolling-refresh-indicator');
+    var polling = true;
+    var timer = null;
 
-    function updateLiveScore() {
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', '<?= e(config('api.base_url')) ?>/match/' + encodeURIComponent(matchId) + '/rolling?minute=0&home_score=0&away_score=0');
-        xhr.timeout = 10000;
-        xhr.onload = function() {
-            if (xhr.status >= 200 && xhr.status < 300) {
-                try {
-                    var data = JSON.parse(xhr.responseText);
-                    // 更新滚球预测卡片
-                    var container = document.getElementById('rollingContainer');
-                    if (container && Array.isArray(data) && data.length > 0) {
-                        var html = '';
-                        data.forEach(function(rp) {
-                            var typeMap = {
-                                'win_draw_lose': '⚽ 胜平负',
-                                'over_under': '📐 大小球',
-                                'asian_handicap': '📏 亚盘',
-                                'next_goal': '🎯 下一进球方'
-                            };
-                            var confClass = '';
-                            var confText = '';
-                            switch ((rp.confidence_level || 'C').toUpperCase()) {
-                                case 'A': confClass = 'badge-hit'; confText = '高信心'; break;
-                                case 'B': confClass = 'badge-hit'; confText = '较高信心'; break;
-                                case 'C': confClass = 'badge-pending'; confText = '中等信心'; break;
-                                case 'D': confClass = 'badge-miss'; confText = '低信心'; break;
-                                default: confClass = ''; confText = rp.confidence_level || '';
-                            }
-                            var prob = parseFloat(rp.probability || 0);
-                            var probStr = (prob > 0 && prob < 1 ? (prob * 100) : prob).toFixed(1) + '%';
-                            html += '<div class="rolling-card">' +
-                                '<div class="rolling-header">' +
-                                    '<span class="rolling-type">' + (typeMap[rp.prediction_type] || rp.prediction_type) + '</span>' +
-                                    '<span class="' + confClass + '">' + confText + '</span>' +
-                                '</div>' +
-                                '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
-                                    '<span class="rolling-label">' + escapeHtml(rp.label || '') + '</span>' +
-                                    '<span class="rolling-prob">' + probStr + '</span>' +
-                                '</div>' +
-                                (rp.rationale ? '<div class="rolling-rationale">' + escapeHtml(rp.rationale) + '</div>' : '') +
-                            '</div>';
-                        });
-                        container.innerHTML = html;
-                    }
-
-                    // 更新更新时间
-                    var timeEl = document.getElementById('rollingUpdateTime');
-                    if (timeEl) {
-                        var now = new Date();
-                        timeEl.textContent = '更新于 ' + now.toLocaleTimeString('zh-CN');
-                    }
-                } catch (e) {
-                    console.error('滚球数据解析失败:', e);
+    function fetchRolling() {
+        if (!polling) return;
+        indicator.textContent = '刷新中...';
+        fetch('/api-proxy.php?endpoint=match/' + matchId + '/rolling')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                indicator.textContent = new Date().toLocaleTimeString();
+                if (!Array.isArray(data) || data.length === 0) {
+                    container.innerHTML = '<div class="text-muted">暂无滚球预测数据</div>';
+                    return;
                 }
-            }
-        };
-        xhr.onerror = function() {
-            console.error('滚球数据请求失败');
-        };
-        xhr.send();
+                var typeLabels = {
+                    'win_draw_lose': '胜平负',
+                    'over_under': '大小球',
+                    'asian_handicap': '亚盘',
+                    'next_goal': '下一进球'
+                };
+                var typeIcons = {
+                    'win_draw_lose': '⚽',
+                    'over_under': '📊',
+                    'asian_handicap': '🏆',
+                    'next_goal': '🎯'
+                };
+                var html = '<div class="rolling-grid">';
+                data.forEach(function(rp) {
+                    var cls = 'confidence-' + (rp.confidence_level || 'C').toLowerCase();
+                    var label = rp.label || '';
+                    var prob = rp.probability ? Math.round(rp.probability * 100) + '%' : '';
+                    html += '<div class="rolling-card ' + cls + '">';
+                    html += '<div class="rolling-card-header">';
+                    html += '<span class="rolling-type-icon">' + (typeIcons[rp.prediction_type] || '📌') + '</span>';
+                    html += '<span class="rolling-type">' + (typeLabels[rp.prediction_type] || rp.prediction_type) + '</span>';
+                    html += '<span class="rolling-confidence ' + cls + '">' + (rp.confidence_level || 'C').toUpperCase() + '</span>';
+                    html += '</div>';
+                    html += '<div class="rolling-card-body">';
+                    html += '<div class="rolling-label">' + label + '</div>';
+                    if (prob) html += '<div class="rolling-prob">' + prob + '</div>';
+                    html += '</div>';
+                    if (rp.rationale) html += '<div class="rolling-rationale">' + rp.rationale + '</div>';
+                    html += '<div class="rolling-card-footer">';
+                    html += '<span>' + (rp.minute || 0) + '\u2032</span>';
+                    html += '<span>' + (rp.current_score || '') + '</span>';
+                    html += '</div></div>';
+                });
+                html += '</div>';
+                container.innerHTML = html;
+            })
+            .catch(function() {
+                indicator.textContent = '刷新失败';
+            });
     }
 
-    function escapeHtml(str) {
-        var div = document.createElement('div');
-        div.appendChild(document.createTextNode(str));
-        return div.innerHTML;
-    }
+    timer = setInterval(fetchRolling, 30000);
 
-    // 首次加载后启动轮询
-    updateLiveScore();
-    pollTimer = setInterval(updateLiveScore, POLL_INTERVAL);
-
-    // 页面隐藏时暂停轮询，可见时恢复
     document.addEventListener('visibilitychange', function() {
-        if (document.hidden) {
-            if (pollTimer) {
-                clearInterval(pollTimer);
-                pollTimer = null;
-            }
-        } else {
-            updateLiveScore();
-            if (!pollTimer) {
-                pollTimer = setInterval(updateLiveScore, POLL_INTERVAL);
-            }
-        }
+        polling = !document.hidden;
+        if (polling) fetchRolling();
     });
 })();
-<?php endif; ?>
 </script>
+<?php endif; ?>
 
 </body>
 </html>

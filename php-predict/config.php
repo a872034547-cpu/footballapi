@@ -1,8 +1,8 @@
 <?php
 return [
     'api' => [
-        'base_url' => 'http://127.0.0.1:8888',
-        'timeout' => 30,
+        'base_url' => 'https://football-intel-api.onrender.com',
+        'timeout' => 45,  // Render 免费层冷启动可能需 ~30s
     ],
     'db' => [
         'path' => __DIR__ . '/data/predict.db',
